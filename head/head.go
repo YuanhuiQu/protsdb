@@ -7,6 +7,7 @@ import (
 
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
+	"github.com/yuanhuiqu/protsdb/wal"
 )
 
 // Head represents the in-memory state of the storage engine.
@@ -20,6 +21,9 @@ type Head struct {
 
 	// Reference counter for generating unique series references
 	lastRef uint64
+
+	// WAL for durability
+	wal *wal.WAL
 
 	// Time bounds and limits
 	minTime   int64 // Minimum time of any sample in the head
@@ -46,22 +50,34 @@ type memChunk struct {
 
 // Options for configuring the head block
 type Options struct {
-	// Maximum number of samples per chunk
+	// ChunkSize is the number of samples per chunk
 	ChunkSize int
+	// WALDir is the directory to store WAL files
+	WALDir string
 }
 
 // NewHead creates a new head block
-func NewHead(opts Options) *Head {
+func NewHead(opts Options) (*Head, error) {
 	if opts.ChunkSize == 0 {
-		opts.ChunkSize = 120 // Default chunk size
+		opts.ChunkSize = 120
+	}
+
+	// Initialize WAL
+	w, err := wal.New(wal.Options{
+		Dir:         opts.WALDir,
+		SegmentSize: 128 * 1024 * 1024, // 128MB segments
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	return &Head{
 		series:    make(map[uint64]*memSeries),
+		wal:       w,
 		chunkSize: opts.ChunkSize,
 		minTime:   math.MaxInt64,
 		maxTime:   math.MinInt64,
-	}
+	}, nil
 }
 
 // getOrCreate returns a series for the given labels, creating a new one if necessary
@@ -84,11 +100,23 @@ func (h *Head) getOrCreate(l labels.Labels) (*memSeries, error) {
 		chunk: &memChunk{},
 	}
 	h.series[ref] = s
+
+	// Log series creation to WAL
+	if err := h.wal.LogSeries(l); err != nil {
+		return nil, err
+	}
+
 	return s, nil
 }
 
 // Append adds a new sample to a series
 func (h *Head) Append(l labels.Labels, sample prompb.Sample) error {
+	// First log the sample to WAL
+	if err := h.wal.LogSample(l, sample); err != nil {
+		return err
+	}
+
+	// Then append to memory
 	s, err := h.getOrCreate(l)
 	if err != nil {
 		return err
@@ -126,4 +154,9 @@ func (h *Head) Series(ref uint64) *memSeries {
 	h.mtx.RLock()
 	defer h.mtx.RUnlock()
 	return h.series[ref]
+}
+
+// Close closes the head block and its WAL
+func (h *Head) Close() error {
+	return h.wal.Close()
 }
